@@ -1,0 +1,300 @@
+'''
+@Author       : windz
+@Date         : 2020-05-08 09:51:48
+LastEditTime : 2020-10-31 16:33:06
+@Description  : A pipline for calling polya tail length
+
+    You can run like this:
+    snakemake -j 8 -p -c 'bsub -J {rulename} -n {threads} -o log/%J.stdout -e log/%J.stderr'
+'''
+import glob
+import os
+
+configfile: 'config.yml'
+
+# create log dir
+if not os.path.exists('log'):
+    os.mkdir('log')
+
+
+SAMPLE_NAME = []
+for sample_name_ in glob.glob('raw_data/*.subreads.bam'):
+    SAMPLE_NAME.append(os.path.basename(sample_name_).split('.')[0])
+
+
+rule all:
+    input:
+        expand('aligned_data/{sample_name}.sorted.tagged.bam', sample_name=SAMPLE_NAME),
+        expand('polyadenylated_data/{sample_name}.polyadenylated.{cov}.{strand}.bw', sample_name=SAMPLE_NAME, strand=['+', '-'], cov=['3end', 'cov']),
+        expand('polyadenylated_data/{sample_name}.full_len.bed.ir_stats.tsv', sample_name=SAMPLE_NAME),
+        expand('polya_sites/{sample_name}.polya_cluster.bed', sample_name=SAMPLE_NAME)
+
+
+rule run_ccs:
+    input:
+        'raw_data/{sample_name}.subreads.bam'
+    output:
+        'raw_data/{sample_name}.ccs.bam'
+    threads:
+        36
+    shell:
+        '''
+ccs --num-threads {threads} --min-rq 0.9 --report-file ccs.report {input} {output}
+        '''
+
+rule run_lima:
+    input:
+        'raw_data/{sample_name}.ccs.bam'
+    output:
+        'raw_data/{sample_name}.fasta'
+    threads: 36
+    params:
+        primer='supplementary_data/primer.fasta'
+    shell:
+        '''
+lima -j {threads} {input} {params.primer} lima.bam --isoseq --peek-guess
+python script/lima_bam2fasta.py lima.primer_3p--primer_5p.bam {output}
+mv lima* raw_data
+        '''
+
+
+rule mapping_to_genome:
+    input:
+        reads='raw_data/{sample_name}.fasta'
+    output:
+        bam='aligned_data/{sample_name}.sorted.bam'
+    params:
+        ref=config['genome'],
+        bed=config['ann_bed'],
+    threads: 64
+    shell:
+        '''
+minimap2 -t {threads} -ax splice -G 10000 --secondary=no --cs \
+--junc-bed {params.bed} --sam-hit-only {params.ref} {input.reads} \
+| samtools sort -@ {threads} -O bam -o {output.bam} -
+samtools index -@10 {output}
+        '''
+        
+
+rule find_polya:
+    input:
+        clean_bam='aligned_data/{sample_name}.sorted.bam',
+    output:
+        tsv='aligned_data/{sample_name}.polyA_tail.result.tsv',
+        fasta='aligned_data/{sample_name}.polyA_tail.fasta'
+    shell:
+        '''
+python script/pacbio_find_polyA.py --infile {input.clean_bam} --out {output.tsv} --fasta {output.fasta}
+        '''
+
+
+rule bedtools_intersect:
+    input:
+        'aligned_data/{sample_name}.sorted.bam'
+    output:
+        temp('aligned_data/{sample_name}.sorted.bed.intersect')
+    threads: 1
+    params:
+        config['ann_bed']
+    shell:
+        '''
+bedtools intersect -abam {input} -b {params} -wo -s -split -bed > {output}
+        '''
+
+
+rule parse_bedtools_output:
+    input:
+        'aligned_data/{sample_name}.sorted.bed.intersect'
+    output:
+        'aligned_data/{sample_name}.sorted.bed.pkl'
+    threads: 1
+    shell:
+        '''
+python script/parse_bedtools_output.py -i {input} -o {output}
+        '''
+
+
+# add polya length and gene_id to bam tags
+rule add_tags_to_bam:
+    input:
+        infile='aligned_data/{sample_name}.sorted.bam',
+        bed_intersect='aligned_data/{sample_name}.sorted.bed.pkl',
+        read_info='aligned_data/{sample_name}.polyA_tail.result.tsv'
+    output:
+        'aligned_data/{sample_name}.sorted.tagged.bam'
+    threads: 1
+    shell:
+        '''
+python script/add_tag_to_bam.py -i {input.infile} -o {output} --read_info {input.read_info} --bed_intersect {input.bed_intersect}
+samtools index -@20 {output}
+        '''
+
+
+rule get_polyadenylated_reads:
+    input:
+        'aligned_data/{sample_name}.sorted.tagged.bam'
+    output:
+        'polyadenylated_data/{sample_name}.polyadenylated.bam'
+    threads: 1
+    shell:
+        '''
+python script/get_polyadenylated_reads.py -i {input} -o {output}
+samtools index -@20 {output}
+        '''
+
+
+rule get_polya_cluster:
+    input:
+        bam='polyadenylated_data/{sample_name}.polyadenylated.bam'
+    output:
+        'polya_sites/{sample_name}.polya_cluster.bed',
+        'polya_sites/{sample_name}.polya_cluster.summit.bed',
+        'polya_sites/{sample_name}.major_polya_cluster.bed',
+        'polya_sites/{sample_name}.major_polya_cluster_summit.bed'
+    params:
+        suffix='polya_sites/{sample_name}',
+        gene_bed='/public/home/mowp/db/Arabidopsis_thaliana/isoform/araport11.gene.bed'
+    threads: 32
+    shell:
+        '''
+python script/get_polya_cluster.py --infile {input.bam} --gene_bed {params.gene_bed} --out_suffix {params.suffix} -t {threads}
+        '''
+
+
+rule get_full_len_transcripts:
+    input:
+        'polyadenylated_data/{sample_name}.polyadenylated.bam'
+    output:
+        'polyadenylated_data/{sample_name}.full_len.bam'
+    threads: 1
+    params:
+        first_exon_path='/public/home/mowp/db/Arabidopsis_thaliana/representative_gene_model/representative_gene_first_exon.bed'
+    shell:
+        '''
+python script/remove_five_prime_lost.py -i {input} -o {output} --first_exon_path {params.first_exon_path}
+sleep 15
+samtools index -@ 16 {output}
+        '''
+
+
+rule bedtools_intersect_for_splice_stats:
+    input:
+        'polyadenylated_data/{sample_name}.full_len.bam'
+    output:
+        'polyadenylated_data/{sample_name}.full_len.bed.intersect'
+    params:
+        repr_bed='~/db/Arabidopsis_thaliana/representative_gene_model/araport11.representative.gene_model.bed'
+    shell:
+        '''
+bedtools intersect -abam {input} -b {params.repr_bed} -wo -s -split -bed > {output}
+        '''
+
+
+rule get_splice_stats:
+    input:
+        'polyadenylated_data/{sample_name}.full_len.bed.intersect'
+    output:
+        ir='polyadenylated_data/{sample_name}.full_len.bed.ir_stats.tsv',
+        es='polyadenylated_data/{sample_name}.full_len.bed.es_stats.tsv'
+    shell:
+        '''
+python script/get_splice_stats.py -i {input} --ir_out {output.ir} --es_out {output.es}
+        '''
+
+
+STRAND = {'plus': '+', 'minus': '-'}
+rule bamtobigwig_split:
+    input:
+        '{dirname}/{sample_name}.bam'
+    output:
+        bedgraph=temp('{dirname}/{sample_name}.cov.{strand}.bedgraph'),
+        bw='{dirname}/{sample_name}.cov.{strand}.bw'
+    threads: 1
+    params:
+        strand='{strand}',
+        chrom_size='/public/home/mowp/db/Arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.chrom.sizes'
+    shell:
+        '''
+bedtools genomecov -split -strand {params.strand} -bg -ibam {input} > {output.bedgraph}
+bedGraphToBigWig {output.bedgraph} {params.chrom_size} {output.bw}
+        '''
+
+
+rule bamtobigwig_3end:
+    input:
+        '{dirname}/{sample_name}.bam'
+    output:
+        bedgraph=temp('{dirname}/{sample_name}.3end.{strand}.bedgraph'),
+        bw='{dirname}/{sample_name}.3end.{strand}.bw'
+    threads: 1
+    params:
+        strand='{strand}',
+        chrom_size='/public/home/mowp/db/Arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.chrom.sizes'
+    shell:
+        '''
+bedtools genomecov -3 -strand {params.strand} -bg -ibam {input} > {output.bedgraph}
+bedGraphToBigWig {output.bedgraph} {params.chrom_size} {output.bw}
+        '''
+
+
+rule identify_read_info:
+    input:
+        'aligned_data/{sample_name}.sorted.bam',
+    output:
+        temp('aligned_data/{sample_name}.read_info.result.tsv')
+    params:
+        'supplementary_data/exon_intron_pos.repr.bed'
+    threads: 1
+    shell:
+        '''
+python script/extract_read_info.py --inbam {input} --inbed {params} --out {output}
+        '''
+
+
+rule merge_info:
+    input:
+        read_info='aligned_data/{sample_name}.read_info.result.tsv',
+        polya='aligned_data/{sample_name}.polyA_tail.result.tsv'
+    output:
+        read_info_result='results/{sample_name}.read.info.tsv'
+    threads: 1
+    shell:
+        '''
+export PATH=/public/home/mowp/miniconda3/envs/R/bin/:$PATH
+Rscript script/merge_read_info.R --type PacBio --inreadinfo {input.read_info} --inpolya {input.polya} --out {output.read_info_result}
+        '''
+
+
+rule splicing_kinetics:
+    input:
+        read_info='results/{sample_name}.read.info.tsv'
+    output:
+        splicing_data='results/{sample_name}.read.intron.pos.splicing.tsv',
+        splicing_kinetics='results/{sample_name}.read.splicing_kinetics.tsv',
+        figure='results/{sample_name}.read.splicing_kinetics.pdf'
+    threads: 1
+    params:
+        repr='supplementary_data/exon_intron_pos.repr.bed',
+        select_introns='supplementary_data/select_introns.txt'
+    shell:
+        '''
+python script/prepare_data_for_splice_kinetics.py --inreadinfo {input.read_info} --inbed {params.repr} --out {output.splicing_data}
+export PATH=/public/home/mowp/miniconda3/envs/R/bin/:$PATH
+Rscript script/plot_intron_splicing_kinetics.R --inrelpos {output.splicing_data} --inreadinfo {input.read_info} --inintron {params.select_introns} --out {output.splicing_kinetics} --pdf {output.figure}
+        '''
+
+
+# Calculate intron retention ratio of polyadenylated transcripts
+rule intron_retention_ratio:
+    input:
+        splicing_data='results/{sample_name}.read.intron.pos.splicing.tsv',
+        read_info='results/{sample_name}.read.info.tsv',
+    output:
+        rna_ir='results/{sample_name}.read.rna.ir.stat',
+        intron_ir='results/{sample_name}.read.intron.ir.stat',
+    threads: 1
+    shell:
+        '''
+export PATH=/public/home/mowp/miniconda3/envs/R/bin/:$PATH
+Rscript script/cal_polya_transcript_ir.R --inrelpos {input.splicing_data} --inreadinfo {input.read_info} --outrna {output.rna_ir} --outintron {output.intron_ir}
+        '''

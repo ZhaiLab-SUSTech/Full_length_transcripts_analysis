@@ -1,0 +1,19 @@
+# genome data
+genome: /public/home/mowp/db/Arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+ann_bed: /public/home/mowp/db/Arabidopsis_thaliana/bed/Araport11.all.bed
+protein_coding: /public/home/mowp/db/Arabidopsis_thaliana/bed/Araport11_protein_coding.201606.bed
+non_coding: /public/home/mowp/db/Arabidopsis_thaliana/bed/Araport11_non_coding.2016016.bed
+
+# gene full length genomic sequences
+gene_bed: /public/home/mowp/db/Arabidopsis_thaliana/isoform/araport11.gene.bed
+
+# nanopore data
+polya_data: /public/home/mowp/data/nanopore_cdna/basecalled_data/nanopore_cdna.polyacaller.tsv
+sequencing_summary: /public/home/mowp/data/nanopore_cdna/basecalled_data/sequencing_summary.txt
+
+# rRNA, Mt, Pt
+excludable_region: supplementary_data/excludable_region.bed
+
+
+representative_gene_model: /public/home/mowp/db/Arabidopsis_thaliana/representative_gene_model/araport11.representative.gene_model.bed
+first_exon_path: /public/home/mowp/db/Arabidopsis_thaliana/representative_gene_model/representative_gene_first_exon.bed
